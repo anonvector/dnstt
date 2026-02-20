@@ -39,6 +39,19 @@ const (
 	pollLimit = 16
 )
 
+// DNSPacketConnConfig holds optional configuration for NewDNSPacketConnWithConfig.
+type DNSPacketConnConfig struct {
+	// PollLimit overrides the default pollLimit (burst limit for empty poll
+	// requests after receiving data). Zero means use the package default.
+	PollLimit int
+	// InitPollDelay overrides the initial poll timer delay.
+	// Zero means use the package default (500ms).
+	InitPollDelay time.Duration
+	// MaxPollDelay overrides the maximum poll timer delay.
+	// Zero means use the package default (10s).
+	MaxPollDelay time.Duration
+}
+
 // base32Encoding is a base32 encoding without padding.
 var base32Encoding = base32.StdEncoding.WithPadding(base32.NoPadding)
 
@@ -62,6 +75,9 @@ type DNSPacketConn struct {
 	// Sending on pollChan permits sendLoop to send an empty polling query.
 	// sendLoop also does its own polling according to a time schedule.
 	pollChan chan struct{}
+	// Configurable poll timing (zero means use package defaults).
+	cfgInitPollDelay time.Duration
+	cfgMaxPollDelay  time.Duration
 	// QueuePacketConn is the direct receiver of ReadFrom and WriteTo calls.
 	// recvLoop and sendLoop take the messages out of the receive and send
 	// queues and actually put them on the network.
@@ -80,6 +96,43 @@ func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name) 
 		domain:          domain,
 		pollChan:        make(chan struct{}, pollLimit),
 		QueuePacketConn: turbotunnel.NewQueuePacketConn(clientID, 0),
+	}
+	go func() {
+		err := c.recvLoop(transport)
+		if err != nil {
+			log.Printf("recvLoop: %v", err)
+		}
+	}()
+	go func() {
+		err := c.sendLoop(transport, addr)
+		if err != nil {
+			log.Printf("sendLoop: %v", err)
+		}
+	}()
+	return c
+}
+
+// NewDNSPacketConnWithConfig is like NewDNSPacketConn but accepts a
+// DNSPacketConnConfig to override defaults. A nil config is equivalent to the
+// zero-value config (all defaults).
+func NewDNSPacketConnWithConfig(transport net.PacketConn, addr net.Addr, domain dns.Name, config *DNSPacketConnConfig) *DNSPacketConn {
+	pl := pollLimit
+	var cfgInit, cfgMax time.Duration
+	if config != nil {
+		if config.PollLimit > 0 {
+			pl = config.PollLimit
+		}
+		cfgInit = config.InitPollDelay
+		cfgMax = config.MaxPollDelay
+	}
+	clientID := turbotunnel.NewClientID()
+	c := &DNSPacketConn{
+		clientID:         clientID,
+		domain:           domain,
+		pollChan:         make(chan struct{}, pl),
+		cfgInitPollDelay: cfgInit,
+		cfgMaxPollDelay:  cfgMax,
+		QueuePacketConn:  turbotunnel.NewQueuePacketConn(clientID, 0),
 	}
 	go func() {
 		err := c.recvLoop(transport)
@@ -350,7 +403,16 @@ func (c *DNSPacketConn) send(transport net.PacketConn, p []byte, addr net.Addr) 
 // on the network using send. It also does polling with empty packets when
 // requested by pollChan or after a timeout.
 func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error {
-	pollDelay := initPollDelay
+	iPollDelay := initPollDelay
+	if c.cfgInitPollDelay > 0 {
+		iPollDelay = c.cfgInitPollDelay
+	}
+	mPollDelay := maxPollDelay
+	if c.cfgMaxPollDelay > 0 {
+		mPollDelay = c.cfgMaxPollDelay
+	}
+
+	pollDelay := iPollDelay
 	pollTimer := time.NewTimer(pollDelay)
 	for {
 		var p []byte
@@ -382,8 +444,8 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 			// We're polling because it's been a while since we last
 			// polled. Increase the poll delay.
 			pollDelay = time.Duration(float64(pollDelay) * pollDelayMultiplier)
-			if pollDelay > maxPollDelay {
-				pollDelay = maxPollDelay
+			if pollDelay > mPollDelay {
+				pollDelay = mPollDelay
 			}
 		} else {
 			// We're sending an actual data packet, or we're polling
@@ -392,7 +454,7 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 			if !pollTimer.Stop() {
 				<-pollTimer.C
 			}
-			pollDelay = initPollDelay
+			pollDelay = iPollDelay
 		}
 		pollTimer.Reset(pollDelay)
 

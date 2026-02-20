@@ -47,6 +47,15 @@ type HTTPPacketConn struct {
 	notBefore     time.Time
 	notBeforeLock sync.RWMutex
 
+	// RetryAfterDefault, when non-zero, overrides the package-level
+	// defaultRetryAfter constant used when no Retry-After header is present.
+	RetryAfterDefault time.Duration
+
+	// SleepOnRateLimit controls the behaviour on 429 / unexpected status.
+	// When true, sendLoop sleeps until the rate-limit window expires
+	// instead of dropping queued packets (the upstream default).
+	SleepOnRateLimit bool
+
 	// QueuePacketConn is the direct receiver of ReadFrom and WriteTo calls.
 	// sendLoop, via send, removes messages from the outgoing queue that
 	// were placed there by WriteTo, and inserts messages into the incoming
@@ -67,6 +76,37 @@ func NewHTTPPacketConn(rt http.RoundTripper, urlString string, numSenders int) (
 		},
 		urlString:       urlString,
 		QueuePacketConn: turbotunnel.NewQueuePacketConn(turbotunnel.DummyAddr{}, 0),
+	}
+	for i := 0; i < numSenders; i++ {
+		go c.sendLoop()
+	}
+	return c, nil
+}
+
+// HTTPPacketConnConfig holds optional overrides for NewHTTPPacketConnWithConfig.
+type HTTPPacketConnConfig struct {
+	// RetryAfterDefault overrides the package-level defaultRetryAfter when
+	// no Retry-After header is present. Zero means use the package default.
+	RetryAfterDefault time.Duration
+	// SleepOnRateLimit, when true, makes sendLoop sleep through a 429
+	// window instead of dropping queued packets (the upstream default).
+	SleepOnRateLimit bool
+}
+
+// NewHTTPPacketConnWithConfig is like NewHTTPPacketConn but accepts an
+// HTTPPacketConnConfig to override rate-limit behaviour.
+func NewHTTPPacketConnWithConfig(rt http.RoundTripper, urlString string, numSenders int, config *HTTPPacketConnConfig) (*HTTPPacketConn, error) {
+	c := &HTTPPacketConn{
+		client: &http.Client{
+			Transport: rt,
+			Timeout:   1 * time.Minute,
+		},
+		urlString:       urlString,
+		QueuePacketConn: turbotunnel.NewQueuePacketConn(turbotunnel.DummyAddr{}, 0),
+	}
+	if config != nil {
+		c.RetryAfterDefault = config.RetryAfterDefault
+		c.SleepOnRateLimit = config.SleepOnRateLimit
 	}
 	for i := 0; i < numSenders; i++ {
 		go c.sendLoop()
@@ -119,7 +159,11 @@ func (c *HTTPPacketConn) send(p []byte) error {
 		}
 		if retryAfter.IsZero() {
 			// Supply a default.
-			retryAfter = now.Add(defaultRetryAfter)
+			d := defaultRetryAfter
+			if c.RetryAfterDefault > 0 {
+				d = c.RetryAfterDefault
+			}
+			retryAfter = now.Add(d)
 		}
 		if retryAfter.Before(now) {
 			log.Printf("got %+q, but Retry-After is %v in the past",
@@ -151,8 +195,13 @@ func (c *HTTPPacketConn) sendLoop() {
 		notBefore := c.notBefore
 		c.notBeforeLock.RUnlock()
 		if wait := notBefore.Sub(time.Now()); wait > 0 {
-			// Drop it.
-			continue
+			if c.SleepOnRateLimit {
+				// Sleep until rate limit expires, then send.
+				time.Sleep(wait)
+			} else {
+				// Drop the packet (upstream default).
+				continue
+			}
 		}
 
 		err := c.send(p)
