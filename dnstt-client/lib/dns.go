@@ -5,10 +5,12 @@ import (
 	"crypto/rand"
 	"encoding/base32"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"strings"
 	"time"
 
 	"www.bamsoftware.com/git/dnstt.git/dns"
@@ -463,6 +465,10 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 		// trying to send more than one packet per query.
 		err := c.send(transport, p, addr)
 		if err != nil {
+			// Stop the loop if the transport has been closed.
+			if errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "use of closed") {
+				return err
+			}
 			log.Printf("send: %v", err)
 			continue
 		}
