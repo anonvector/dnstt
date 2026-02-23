@@ -164,7 +164,7 @@ func AcceptLoop(ln *pt.SocksListener, utlsClientHelloID *utls.ClientHelloID, shu
 				} else {
 					rt = NewUTLSRoundTripper(nil, utlsClientHelloID)
 				}
-				pconn, err = NewHTTPPacketConn(rt, arg, 32)
+				pconn, err = NewHTTPPacketConn(rt, arg, 12)
 
 			} else if arg, ok := local.Req.Args.Get("dot"); ok {
 				remoteAddr = turbotunnel.DummyAddr{}
