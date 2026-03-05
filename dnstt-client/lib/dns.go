@@ -25,6 +25,11 @@ const (
 	// because the prefix codes indicating padding start at 224.
 	numPaddingForPoll = 8
 
+	// NumPadding is the exported version of numPadding for use by external modules.
+	NumPadding = numPadding
+	// NumPaddingForPoll is the exported version of numPaddingForPoll for use by external modules.
+	NumPaddingForPoll = numPaddingForPoll
+
 	// sendLoop has a poll timer that automatically sends an empty polling
 	// query when a certain amount of time has elapsed without a send. The
 	// poll timer is initially set to initPollDelay. It increases by a
@@ -40,6 +45,26 @@ const (
 	// as a result of receiving data.
 	pollLimit = 16
 )
+
+// SendFunc is the type for custom send functions that can replace the default
+// base32 send behavior. It receives the transport, payload bytes, and address.
+type SendFunc func(transport net.PacketConn, p []byte, addr net.Addr) error
+
+// DNSPacketConnHooks allows external modules to plug custom behavior into
+// DNSPacketConn without modifying the core send loop.
+type DNSPacketConnHooks struct {
+	// CustomSendFunc, if non-nil, replaces the default send() in sendLoop.
+	CustomSendFunc SendFunc
+	// PreSendHook, if non-nil, is called before each send in sendLoop
+	// (e.g., for adding jitter).
+	PreSendHook func()
+	// OnStart, if non-nil, is called once when sendLoop begins
+	// (e.g., to start cover traffic goroutines).
+	OnStart func(transport net.PacketConn, addr net.Addr)
+	// ClientID, if non-nil, overrides the randomly generated ClientID.
+	// This allows the caller to share the ClientID with the custom send function.
+	ClientID *turbotunnel.ClientID
+}
 
 // DNSPacketConnConfig holds optional configuration for NewDNSPacketConnWithConfig.
 type DNSPacketConnConfig struct {
@@ -80,10 +105,24 @@ type DNSPacketConn struct {
 	// Configurable poll timing (zero means use package defaults).
 	cfgInitPollDelay time.Duration
 	cfgMaxPollDelay  time.Duration
+
+	// hooks holds optional pluggable behavior for sendLoop.
+	hooks *DNSPacketConnHooks
+
 	// QueuePacketConn is the direct receiver of ReadFrom and WriteTo calls.
 	// recvLoop and sendLoop take the messages out of the receive and send
 	// queues and actually put them on the network.
 	*turbotunnel.QueuePacketConn
+}
+
+// ClientID returns the client's turbotunnel ClientID.
+func (c *DNSPacketConn) ClientID() turbotunnel.ClientID {
+	return c.clientID
+}
+
+// Domain returns the tunnel domain.
+func (c *DNSPacketConn) Domain() dns.Name {
+	return c.domain
 }
 
 // NewDNSPacketConn creates a new DNSPacketConn. transport, through its WriteTo
@@ -151,6 +190,52 @@ func NewDNSPacketConnWithConfig(transport net.PacketConn, addr net.Addr, domain 
 	return c
 }
 
+// NewDNSPacketConnWithHooks is like NewDNSPacketConnWithConfig but also accepts
+// DNSPacketConnHooks for pluggable send behavior. This allows external modules
+// to inject custom encoding, jitter, and cover traffic without
+// modifying the core send loop.
+func NewDNSPacketConnWithHooks(transport net.PacketConn, addr net.Addr, domain dns.Name, config *DNSPacketConnConfig, hooks *DNSPacketConnHooks) *DNSPacketConn {
+	pl := pollLimit
+	var cfgInit, cfgMax time.Duration
+	if config != nil {
+		if config.PollLimit > 0 {
+			pl = config.PollLimit
+		}
+		cfgInit = config.InitPollDelay
+		cfgMax = config.MaxPollDelay
+	}
+
+	var clientID turbotunnel.ClientID
+	if hooks != nil && hooks.ClientID != nil {
+		clientID = *hooks.ClientID
+	} else {
+		clientID = turbotunnel.NewClientID()
+	}
+
+	c := &DNSPacketConn{
+		clientID:         clientID,
+		domain:           domain,
+		pollChan:         make(chan struct{}, pl),
+		cfgInitPollDelay: cfgInit,
+		cfgMaxPollDelay:  cfgMax,
+		hooks:            hooks,
+		QueuePacketConn:  turbotunnel.NewQueuePacketConn(clientID, 0),
+	}
+	go func() {
+		err := c.recvLoop(transport)
+		if err != nil {
+			log.Printf("recvLoop: %v", err)
+		}
+	}()
+	go func() {
+		err := c.sendLoop(transport, addr)
+		if err != nil {
+			log.Printf("sendLoop: %v", err)
+		}
+	}()
+	return c
+}
+
 // dnsResponsePayload extracts the downstream payload of a DNS response, encoded
 // into the RDATA of a TXT RR. It returns nil if the message doesn't pass format
 // checks, or if the name in its Question entry is not a subdomain of domain.
@@ -174,16 +259,19 @@ func dnsResponsePayload(resp *dns.Message, domain dns.Name) []byte {
 		return nil
 	}
 
-	if answer.Type != dns.RRTypeTXT {
-		// We only support TYPE == TXT.
+	switch answer.Type {
+	case dns.RRTypeTXT:
+		payload, err := dns.DecodeRDataTXT(answer.Data)
+		if err != nil {
+			return nil
+		}
+		return payload
+	case dns.RRTypeA, dns.RRTypeAAAA:
+		// A/AAAA responses carry no downstream payload (poll responses).
+		return nil
+	default:
 		return nil
 	}
-	payload, err := dns.DecodeRDataTXT(answer.Data)
-	if err != nil {
-		return nil
-	}
-
-	return payload
 }
 
 // nextPacket reads the next length-prefixed packet from r. It returns a nil
@@ -405,6 +493,11 @@ func (c *DNSPacketConn) send(transport net.PacketConn, p []byte, addr net.Addr) 
 // on the network using send. It also does polling with empty packets when
 // requested by pollChan or after a timeout.
 func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error {
+	// Fire OnStart hook (e.g., to launch cover traffic).
+	if c.hooks != nil && c.hooks.OnStart != nil {
+		c.hooks.OnStart(transport, addr)
+	}
+
 	iPollDelay := initPollDelay
 	if c.cfgInitPollDelay > 0 {
 		iPollDelay = c.cfgInitPollDelay
@@ -460,10 +553,20 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 		}
 		pollTimer.Reset(pollDelay)
 
+		// PreSendHook (e.g., jitter) runs before each send.
+		if c.hooks != nil && c.hooks.PreSendHook != nil {
+			c.hooks.PreSendHook()
+		}
+
 		// Unlike in the server, in the client we assume that because
 		// the data capacity of queries is so limited, it's not worth
 		// trying to send more than one packet per query.
-		err := c.send(transport, p, addr)
+		var err error
+		if c.hooks != nil && c.hooks.CustomSendFunc != nil {
+			err = c.hooks.CustomSendFunc(transport, p, addr)
+		} else {
+			err = c.send(transport, p, addr)
+		}
 		if err != nil {
 			// Stop the loop if the transport has been closed.
 			if errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "use of closed") {
