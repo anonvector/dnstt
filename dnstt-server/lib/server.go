@@ -31,7 +31,13 @@ const (
 	ResponseTTL = 60
 
 	// How long we may wait for downstream data before sending an empty
+	// response. If another query comes in while we are waiting, we'll send
+	// an empty response anyway and restart the delay timer for the next
 	// response.
+	//
+	// This number should be less than 2 seconds, which in 2019 was reported
+	// to be the query timeout of the Quad9 DoH server.
+	// https://dnsencryption.info/imc19-doe.html Section 4.2, Finding 2.4
 	MaxResponseDelay = 1 * time.Second
 
 	// How long to wait for a TCP connection to upstream to be established.
@@ -265,7 +271,7 @@ func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream string) error 
 	smuxConfig := smux.DefaultConfig()
 	smuxConfig.Version = 2
 	smuxConfig.KeepAliveTimeout = IdleTimeout
-	smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024
+	smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024 // default is 65536
 	sess, err := smux.Server(rw, smuxConfig)
 	if err != nil {
 		return err
