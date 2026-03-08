@@ -575,3 +575,4 @@ func EncodeRDataTXT(p []byte) []byte {
 	buf.Write(p)
 	return buf.Bytes()
 }
+

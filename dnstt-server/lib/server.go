@@ -82,7 +82,7 @@ func defaultDecode(prefix dns.Name) ([]byte, error) {
 	return payload[:n], nil
 }
 
-// defaultAcceptQueryType accepts only TXT queries.
+// defaultAcceptQueryType accepts TXT queries only.
 func defaultAcceptQueryType(qtype uint16) bool {
 	return qtype == dns.RRTypeTXT
 }
@@ -382,7 +382,8 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 	}
 }
 
-// sendLoop sends DNS responses, packing downstream data into TXT answers.
+// sendLoop sends DNS responses, packing downstream data into TXT or A answers.
+
 func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-chan *record, maxEncodedPayload int, maxUDPPayload int, hooks *ServerHooks) error {
 	var nextRec *record
 	for {
@@ -400,8 +401,8 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 		if rec.Resp.Rcode() == dns.RcodeNoError && len(rec.Resp.Question) == 1 {
 			qtype := rec.Resp.Question[0].Type
 
-			// Check if a hook wants to handle non-TXT responses.
-			if qtype != dns.RRTypeTXT && hooks != nil && hooks.HandleNonTXT != nil {
+			// Check if a hook wants to handle non-tunnel responses.
+			if qtype != dns.RRTypeTXT && qtype != dns.RRTypeA && qtype != dns.RRTypeAAAA && hooks != nil && hooks.HandleNonTXT != nil {
 				if data := hooks.HandleNonTXT(qtype); data != nil {
 					rec.Resp.Answer = []dns.RR{
 						{
@@ -417,16 +418,7 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 			}
 
 			if qtype == dns.RRTypeTXT {
-				rec.Resp.Answer = []dns.RR{
-					{
-						Name:  rec.Resp.Question[0].Name,
-						Type:  rec.Resp.Question[0].Type,
-						Class: rec.Resp.Question[0].Class,
-						TTL:   ResponseTTL,
-						Data:  nil,
-					},
-				}
-
+				// Collect downstream packets.
 				var payload bytes.Buffer
 				limit := maxEncodedPayload
 				timer := time.NewTimer(MaxResponseDelay)
@@ -470,7 +462,15 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 				}
 				timer.Stop()
 
-				rec.Resp.Answer[0].Data = dns.EncodeRDataTXT(payload.Bytes())
+				rec.Resp.Answer = []dns.RR{
+					{
+						Name:  rec.Resp.Question[0].Name,
+						Type:  dns.RRTypeTXT,
+						Class: rec.Resp.Question[0].Class,
+						TTL:   ResponseTTL,
+						Data:  dns.EncodeRDataTXT(payload.Bytes()),
+					},
+				}
 			}
 		}
 

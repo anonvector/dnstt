@@ -248,7 +248,7 @@ func dnsResponsePayload(resp *dns.Message, domain dns.Name) []byte {
 		return nil
 	}
 
-	if len(resp.Answer) != 1 {
+	if len(resp.Answer) == 0 {
 		return nil
 	}
 	answer := resp.Answer[0]
@@ -259,19 +259,17 @@ func dnsResponsePayload(resp *dns.Message, domain dns.Name) []byte {
 		return nil
 	}
 
-	switch answer.Type {
-	case dns.RRTypeTXT:
-		payload, err := dns.DecodeRDataTXT(answer.Data)
-		if err != nil {
-			return nil
-		}
-		return payload
-	case dns.RRTypeA, dns.RRTypeAAAA:
-		// A/AAAA responses carry no downstream payload (poll responses).
-		return nil
-	default:
+	if answer.Type != dns.RRTypeTXT {
 		return nil
 	}
+	if len(resp.Answer) != 1 {
+		return nil
+	}
+	payload, err := dns.DecodeRDataTXT(answer.Data)
+	if err != nil {
+		return nil
+	}
+	return payload
 }
 
 // nextPacket reads the next length-prefixed packet from r. It returns a nil
