@@ -140,13 +140,13 @@ func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name) 
 	}
 	go func() {
 		err := c.recvLoop(transport)
-		if err != nil {
+		if err != nil && !isClosedConnError(err) {
 			log.Printf("recvLoop: %v", err)
 		}
 	}()
 	go func() {
 		err := c.sendLoop(transport, addr)
-		if err != nil {
+		if err != nil && !isClosedConnError(err) {
 			log.Printf("sendLoop: %v", err)
 		}
 	}()
@@ -177,13 +177,13 @@ func NewDNSPacketConnWithConfig(transport net.PacketConn, addr net.Addr, domain 
 	}
 	go func() {
 		err := c.recvLoop(transport)
-		if err != nil {
+		if err != nil && !isClosedConnError(err) {
 			log.Printf("recvLoop: %v", err)
 		}
 	}()
 	go func() {
 		err := c.sendLoop(transport, addr)
-		if err != nil {
+		if err != nil && !isClosedConnError(err) {
 			log.Printf("sendLoop: %v", err)
 		}
 	}()
@@ -223,13 +223,13 @@ func NewDNSPacketConnWithHooks(transport net.PacketConn, addr net.Addr, domain d
 	}
 	go func() {
 		err := c.recvLoop(transport)
-		if err != nil {
+		if err != nil && !isClosedConnError(err) {
 			log.Printf("recvLoop: %v", err)
 		}
 	}()
 	go func() {
 		err := c.sendLoop(transport, addr)
-		if err != nil {
+		if err != nil && !isClosedConnError(err) {
 			log.Printf("sendLoop: %v", err)
 		}
 	}()
@@ -485,6 +485,12 @@ func (c *DNSPacketConn) send(transport net.PacketConn, p []byte, addr net.Addr) 
 
 	_, err = transport.WriteTo(buf, addr)
 	return err
+}
+
+// isClosedConnError reports whether err is a "use of closed network connection"
+// error, which is expected during graceful shutdown.
+func isClosedConnError(err error) bool {
+	return errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "use of closed")
 }
 
 // sendLoop takes packets that have been written using c.WriteTo, and sends them
