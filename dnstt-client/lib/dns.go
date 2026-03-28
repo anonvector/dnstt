@@ -18,8 +18,9 @@ import (
 )
 
 const (
-	// numPadding How many bytes of random padding to insert into queries.
-	numPadding = 3
+	// numPadding How many bytes of random padding to insert into data queries.
+	// Data payloads already vary, so no extra padding is needed for cache busting.
+	numPadding = 0
 	// In an otherwise empty polling query, insert even more random padding,
 	// to reduce the chance of a cache hit. Cannot be greater than 31,
 	// because the prefix codes indicating padding start at 224.
@@ -37,13 +38,13 @@ const (
 	// to a maximum of maxPollDelay. The poll timer is reset to
 	// initPollDelay whenever an a send occurs that is not the result of the
 	// poll timer expiring.
-	initPollDelay       = 500 * time.Millisecond
+	initPollDelay       = 1 * time.Second
 	maxPollDelay        = 10 * time.Second
 	pollDelayMultiplier = 2.0
 
 	// A limit on the number of empty poll requests we may send in a burst
 	// as a result of receiving data.
-	pollLimit = 16
+	pollLimit = 10
 )
 
 // SendFunc is the type for custom send functions that can replace the default
@@ -77,6 +78,21 @@ type DNSPacketConnConfig struct {
 	// MaxPollDelay overrides the maximum poll timer delay.
 	// Zero means use the package default (10s).
 	MaxPollDelay time.Duration
+	// EDNS0Size overrides the EDNS(0) UDP payload size advertised in queries.
+	// This tells the server the maximum DNS response size this client accepts.
+	// Zero means use the default (4096). Common values: 1232 (RFC 8020),
+	// 4096 (maximum throughput).
+	EDNS0Size int
+	// PollJitter adds ±30% random variation to poll timer intervals.
+	// This breaks the deterministic exponential backoff pattern that
+	// DPI can fingerprint. Default is false (upstream dnstt behavior).
+	PollJitter bool
+	// BurstMode shapes idle polling to mimic real browsing DNS patterns.
+	// Instead of exponential backoff, idle polls are sent in small bursts
+	// (2-5 queries ~80ms apart) separated by longer silences (2-8s),
+	// resembling page-load → reading → page-load cycles.
+	// Requires PollJitter to be true. Default is false.
+	BurstMode bool
 }
 
 // base32Encoding is a base32 encoding without padding.
@@ -105,6 +121,12 @@ type DNSPacketConn struct {
 	// Configurable poll timing (zero means use package defaults).
 	cfgInitPollDelay time.Duration
 	cfgMaxPollDelay  time.Duration
+	// edns0Size is the EDNS(0) UDP payload size to advertise. 0 = 4096.
+	edns0Size int
+	// pollJitter enables ±30% random variation on poll timer intervals.
+	pollJitter bool
+	// burstMode shapes idle polls into bursts separated by silences.
+	burstMode bool
 
 	// hooks holds optional pluggable behavior for sendLoop.
 	hooks *DNSPacketConnHooks
@@ -113,6 +135,14 @@ type DNSPacketConn struct {
 	// recvLoop and sendLoop take the messages out of the receive and send
 	// queues and actually put them on the network.
 	*turbotunnel.QueuePacketConn
+}
+
+// edns0Class returns the EDNS(0) UDP payload size to advertise.
+func (c *DNSPacketConn) edns0Class() uint16 {
+	if c.edns0Size > 0 {
+		return uint16(c.edns0Size)
+	}
+	return 4096
 }
 
 // ClientID returns the client's turbotunnel ClientID.
@@ -159,12 +189,17 @@ func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name) 
 func NewDNSPacketConnWithConfig(transport net.PacketConn, addr net.Addr, domain dns.Name, config *DNSPacketConnConfig) *DNSPacketConn {
 	pl := pollLimit
 	var cfgInit, cfgMax time.Duration
+	var edns0 int
+	var pollJitter, burstMode bool
 	if config != nil {
 		if config.PollLimit > 0 {
 			pl = config.PollLimit
 		}
 		cfgInit = config.InitPollDelay
 		cfgMax = config.MaxPollDelay
+		edns0 = config.EDNS0Size
+		pollJitter = config.PollJitter
+		burstMode = config.BurstMode
 	}
 	clientID := turbotunnel.NewClientID()
 	c := &DNSPacketConn{
@@ -173,6 +208,9 @@ func NewDNSPacketConnWithConfig(transport net.PacketConn, addr net.Addr, domain 
 		pollChan:         make(chan struct{}, pl),
 		cfgInitPollDelay: cfgInit,
 		cfgMaxPollDelay:  cfgMax,
+		edns0Size:        edns0,
+		pollJitter:       pollJitter,
+		burstMode:        burstMode,
 		QueuePacketConn:  turbotunnel.NewQueuePacketConn(clientID, 0),
 	}
 	go func() {
@@ -197,12 +235,17 @@ func NewDNSPacketConnWithConfig(transport net.PacketConn, addr net.Addr, domain 
 func NewDNSPacketConnWithHooks(transport net.PacketConn, addr net.Addr, domain dns.Name, config *DNSPacketConnConfig, hooks *DNSPacketConnHooks) *DNSPacketConn {
 	pl := pollLimit
 	var cfgInit, cfgMax time.Duration
+	var edns0 int
+	var pollJitter, burstMode bool
 	if config != nil {
 		if config.PollLimit > 0 {
 			pl = config.PollLimit
 		}
 		cfgInit = config.InitPollDelay
 		cfgMax = config.MaxPollDelay
+		edns0 = config.EDNS0Size
+		pollJitter = config.PollJitter
+		burstMode = config.BurstMode
 	}
 
 	var clientID turbotunnel.ClientID
@@ -218,6 +261,9 @@ func NewDNSPacketConnWithHooks(transport net.PacketConn, addr net.Addr, domain d
 		pollChan:         make(chan struct{}, pl),
 		cfgInitPollDelay: cfgInit,
 		cfgMaxPollDelay:  cfgMax,
+		edns0Size:        edns0,
+		pollJitter:       pollJitter,
+		burstMode:        burstMode,
 		hooks:            hooks,
 		QueuePacketConn:  turbotunnel.NewQueuePacketConn(clientID, 0),
 	}
@@ -472,8 +518,8 @@ func (c *DNSPacketConn) send(transport net.PacketConn, p []byte, addr net.Addr) 
 			{
 				Name:  dns.Name{},
 				Type:  dns.RRTypeOPT,
-				Class: 4096, // requester's UDP payload size
-				TTL:   0,    // extended RCODE and flags
+				Class: c.edns0Class(), // requester's UDP payload size
+				TTL:   0,              // extended RCODE and flags
 				Data:  []byte{},
 			},
 		},
@@ -485,6 +531,17 @@ func (c *DNSPacketConn) send(transport net.PacketConn, p []byte, addr net.Addr) 
 
 	_, err = transport.WriteTo(buf, addr)
 	return err
+}
+
+// jitter adds ±30% random variation to a duration, making poll intervals
+// non-deterministic. This prevents DPI from fingerprinting the exponential
+// backoff pattern.
+func jitter(d time.Duration) time.Duration {
+	var b [2]byte
+	_, _ = rand.Read(b[:])
+	// Scale to 0.7–1.3× the base duration.
+	frac := 0.7 + 0.6*float64(binary.BigEndian.Uint16(b[:]))/65535.0
+	return time.Duration(float64(d) * frac)
 }
 
 // isClosedConnError reports whether err is a "use of closed network connection"
@@ -511,8 +568,20 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 		mPollDelay = c.cfgMaxPollDelay
 	}
 
+	applyJitter := func(d time.Duration) time.Duration {
+		if c.pollJitter {
+			return jitter(d)
+		}
+		return d
+	}
+
+	// Burst mode state: idle polls are grouped into small bursts
+	// (2-5 queries ~150ms apart) separated by silences (2-8s),
+	// mimicking page-load → reading → page-load DNS patterns.
+	var burstRemaining int
+
 	pollDelay := iPollDelay
-	pollTimer := time.NewTimer(pollDelay)
+	pollTimer := time.NewTimer(applyJitter(pollDelay))
 	for {
 		var p []byte
 		outgoing := c.QueuePacketConn.OutgoingQueue(addr)
@@ -540,11 +609,28 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 		}
 
 		if pollTimerExpired {
-			// We're polling because it's been a while since we last
-			// polled. Increase the poll delay.
-			pollDelay = time.Duration(float64(pollDelay) * pollDelayMultiplier)
-			if pollDelay > mPollDelay {
-				pollDelay = mPollDelay
+			if c.burstMode {
+				// Burst mode: group idle polls into bursts with
+				// silences between them.
+				if burstRemaining > 0 {
+					// Inside a burst: short delay between polls.
+					pollDelay = 120*time.Millisecond + jitter(80*time.Millisecond)
+					burstRemaining--
+				} else {
+					// Burst finished: silence, then start a new burst.
+					// Silence: 2-8s (mimics user reading a page).
+					pollDelay = 2*time.Second + jitter(3*time.Second)
+					// Next burst: 2-5 polls.
+					var b [1]byte
+					_, _ = rand.Read(b[:])
+					burstRemaining = 2 + int(b[0])%4
+				}
+			} else {
+				// Standard: exponential backoff.
+				pollDelay = time.Duration(float64(pollDelay) * pollDelayMultiplier)
+				if pollDelay > mPollDelay {
+					pollDelay = mPollDelay
+				}
 			}
 		} else {
 			// We're sending an actual data packet, or we're polling
@@ -554,8 +640,9 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 				<-pollTimer.C
 			}
 			pollDelay = iPollDelay
+			burstRemaining = 0
 		}
-		pollTimer.Reset(pollDelay)
+		pollTimer.Reset(applyJitter(pollDelay))
 
 		// PreSendHook (e.g., jitter) runs before each send.
 		if c.hooks != nil && c.hooks.PreSendHook != nil {
