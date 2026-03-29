@@ -18,6 +18,10 @@ import (
 // header in an HTTP response.
 const defaultRetryAfter = 10 * time.Second
 
+// consecutiveFailureThreshold is the number of back-to-back send errors
+// before the transport is reset (forcing a fresh TLS handshake).
+const consecutiveFailureThreshold = 5
+
 // HTTPPacketConn is an HTTP-based transport for DNS messages, used for DNS over
 // HTTPS (DoH). Its WriteTo and ReadFrom methods exchange DNS messages over HTTP
 // requests and responses.
@@ -55,6 +59,12 @@ type HTTPPacketConn struct {
 	// When true, sendLoop sleeps until the rate-limit window expires
 	// instead of dropping queued packets (the upstream default).
 	SleepOnRateLimit bool
+
+	// consecutiveFailures counts back-to-back send errors across all
+	// sendLoop goroutines. After consecutiveFailureThreshold the transport
+	// is reset to force a fresh TLS connection.
+	consecutiveFailures int
+	failureLock         sync.Mutex
 
 	// QueuePacketConn is the direct receiver of ReadFrom and WriteTo calls.
 	// sendLoop, via send, removes messages from the outgoing queue that
@@ -207,8 +217,46 @@ func (c *HTTPPacketConn) sendLoop() {
 		err := c.send(p)
 		if err != nil {
 			log.Printf("sendLoop: %v", err)
+			c.recordFailure()
+		} else {
+			c.recordSuccess()
 		}
 	}
+}
+
+// recordFailure increments the consecutive failure counter and resets the
+// transport after consecutiveFailureThreshold errors in a row.
+func (c *HTTPPacketConn) recordFailure() {
+	c.failureLock.Lock()
+	c.consecutiveFailures++
+	n := c.consecutiveFailures
+	c.failureLock.Unlock()
+
+	if n == consecutiveFailureThreshold {
+		log.Printf("DoH health: %d consecutive failures, resetting transport", n)
+		c.resetTransport()
+	}
+}
+
+// recordSuccess resets the consecutive failure counter.
+func (c *HTTPPacketConn) recordSuccess() {
+	c.failureLock.Lock()
+	c.consecutiveFailures = 0
+	c.failureLock.Unlock()
+}
+
+// resetTransport forces the underlying HTTP transport to establish a fresh
+// TLS connection on the next request.
+func (c *HTTPPacketConn) resetTransport() {
+	rt := c.client.Transport
+	if resettable, ok := rt.(interface{ Reset() }); ok {
+		resettable.Reset()
+	}
+	// Also reset the failure counter so the next round of attempts
+	// gets a full window before triggering another reset.
+	c.failureLock.Lock()
+	c.consecutiveFailures = 0
+	c.failureLock.Unlock()
 }
 
 // parseRetryAfter parses the value of a Retry-After header as an absolute

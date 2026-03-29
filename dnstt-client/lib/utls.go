@@ -178,6 +178,14 @@ func (rt *utlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error)
 	return rt.inner.RoundTrip(req)
 }
 
+// Reset discards the inner transport so the next RoundTrip establishes a
+// fresh TLS connection. Safe to call from any goroutine.
+func (rt *utlsRoundTripper) Reset() {
+	rt.innerLock.Lock()
+	rt.inner = nil
+	rt.innerLock.Unlock()
+}
+
 // makeRoundTripper makes a bootstrap TLS configuration using the given TLS
 // configuration and ClientHelloID, and creates an http.Transport or
 // http2.Transport, depending on the negotated ALPN. The Transport is set up to
