@@ -22,6 +22,12 @@ const defaultRetryAfter = 10 * time.Second
 // before the transport is reset (forcing a fresh TLS handshake).
 const consecutiveFailureThreshold = 5
 
+// sendErrorBackoff is the delay after a failed send before the goroutine
+// dequeues the next packet. Without this, all senders drain the queue at
+// full speed during an outage, losing every packet and starving KCP
+// retransmissions.
+const sendErrorBackoff = 2 * time.Second
+
 // HTTPPacketConn is an HTTP-based transport for DNS messages, used for DNS over
 // HTTPS (DoH). Its WriteTo and ReadFrom methods exchange DNS messages over HTTP
 // requests and responses.
@@ -218,6 +224,9 @@ func (c *HTTPPacketConn) sendLoop() {
 		if err != nil {
 			log.Printf("sendLoop: %v", err)
 			c.recordFailure()
+			// Back off before dequeuing the next packet so we don't
+			// burn through the entire queue while the transport is dead.
+			time.Sleep(sendErrorBackoff)
 		} else {
 			c.recordSuccess()
 		}
