@@ -42,6 +42,15 @@ const (
 
 	// How long to wait for a TCP connection to upstream to be established.
 	UpstreamDialTimeout = 30 * time.Second
+
+	// Maximum concurrent streams per KCP session. Prevents a single client
+	// from exhausting server resources.
+	MaxStreamsPerSession = 32
+
+	// Maximum concurrent KCP sessions. Each session consumes ~1MB+ of memory
+	// (KCP buffers + smux + Noise state). Limits total memory usage on
+	// high-traffic public servers.
+	MaxSessions = 512
 )
 
 // base32Encoding is a base32 encoding without padding.
@@ -235,26 +244,20 @@ func handleStream(stream *smux.Stream, upstream string, conv uint32) error {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		_, err := io.Copy(stream, upstreamTCPConn)
-		if err == io.EOF {
-			err = nil
-		}
-		if err != nil && !errors.Is(err, io.ErrClosedPipe) {
-			log.Printf("stream %08x:%d copy stream←upstream: %v", conv, stream.ID(), err)
-		}
+		_, _ = io.Copy(stream, upstreamTCPConn)
 		_ = upstreamTCPConn.CloseRead()
 		_ = stream.Close()
 	}()
 	go func() {
 		defer wg.Done()
 		_, err := io.Copy(upstreamTCPConn, stream)
-		if err == io.EOF {
-			err = nil
-		}
-		if err != nil && !errors.Is(err, io.ErrClosedPipe) {
-			log.Printf("stream %08x:%d copy upstream←stream: %v", conv, stream.ID(), err)
-		}
 		_ = upstreamTCPConn.CloseWrite()
+		if err != nil {
+			// Stream was forcefully closed (e.g. session timeout after
+			// client disconnect). Close the upstream read side so the
+			// upstream→stream goroutine unblocks instead of leaking.
+			_ = upstreamTCPConn.CloseRead()
+		}
 	}()
 	wg.Wait()
 
@@ -271,7 +274,7 @@ func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream string) error 
 	smuxConfig := smux.DefaultConfig()
 	smuxConfig.Version = 2
 	smuxConfig.KeepAliveTimeout = IdleTimeout
-	smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024 // default is 65536
+	smuxConfig.MaxStreamBuffer = 1 * 1024 * 1024 // 1MB — supports ~10 Mbps at 100ms RTT
 	sess, err := smux.Server(rw, smuxConfig)
 	if err != nil {
 		return err
@@ -279,6 +282,8 @@ func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream string) error 
 	defer func() {
 		_ = sess.Close()
 	}()
+
+	streamSem := make(chan struct{}, MaxStreamsPerSession)
 
 	for {
 		stream, err := sess.AcceptStream()
@@ -289,15 +294,24 @@ func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream string) error 
 			}
 			return err
 		}
-		log.Printf("begin stream %08x:%d", conn.GetConv(), stream.ID())
+
+		select {
+		case streamSem <- struct{}{}:
+		default:
+			// At capacity — reject this stream.
+			log.Printf("session %08x: rejecting stream %d (limit %d)", conn.GetConv(), stream.ID(), MaxStreamsPerSession)
+			_ = stream.Close()
+			continue
+		}
+
 		go func() {
 			defer func() {
-				log.Printf("end stream %08x:%d", conn.GetConv(), stream.ID())
 				_ = stream.Close()
+				<-streamSem
 			}()
 			err := handleStream(stream, upstream, conn.GetConv())
 			if err != nil {
-				log.Printf("stream %08x:%d handleStream: %v", conn.GetConv(), stream.ID(), err)
+				log.Printf("session %08x: stream %d error: %v", conn.GetConv(), stream.ID(), err)
 			}
 		}()
 	}
@@ -305,6 +319,8 @@ func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream string) error 
 
 // acceptSessions listens for incoming KCP connections.
 func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int, upstream string) error {
+	sessionSem := make(chan struct{}, MaxSessions)
+
 	for {
 		conn, err := ln.AcceptKCP()
 		if err != nil {
@@ -314,7 +330,16 @@ func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int, upstream string) 
 			}
 			return err
 		}
-		log.Printf("begin session %08x", conn.GetConv())
+
+		select {
+		case sessionSem <- struct{}{}:
+		default:
+			// At capacity — reject this session.
+			log.Printf("rejecting session %08x (limit %d)", conn.GetConv(), MaxSessions)
+			_ = conn.Close()
+			continue
+		}
+
 		conn.SetStreamMode(true)
 		conn.SetNoDelay(0, 0, 0, 1)
 		conn.SetWindowSize(turbotunnel.QueueSize/2, turbotunnel.QueueSize/2)
@@ -323,12 +348,12 @@ func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int, upstream string) 
 		}
 		go func() {
 			defer func() {
-				log.Printf("end session %08x", conn.GetConv())
 				_ = conn.Close()
+				<-sessionSem
 			}()
 			err := acceptStreams(conn, privkey, upstream)
 			if err != nil && !errors.Is(err, io.ErrClosedPipe) {
-				log.Printf("session %08x acceptStreams: %v", conn.GetConv(), err)
+				log.Printf("session %08x: %v", conn.GetConv(), err)
 			}
 		}()
 	}
@@ -370,7 +395,6 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 		} else {
 			if resp != nil && resp.Rcode() == dns.RcodeNoError {
 				resp.Flags |= dns.RcodeNameError
-				log.Printf("NXDOMAIN: %d bytes are too short to contain a ClientID", n)
 			}
 		}
 		if resp != nil {

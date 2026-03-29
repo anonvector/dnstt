@@ -7,6 +7,10 @@ import (
 	"time"
 )
 
+// MaxClients is the maximum number of concurrent client entries in a RemoteMap.
+// Beyond this limit, the oldest entries are evicted to make room.
+const MaxClients = 4096
+
 // remoteRecord is a record of a recently seen remote peer, with the time it was
 // last seen and queues of outgoing packets.
 type remoteRecord struct {
@@ -30,11 +34,16 @@ type RemoteMap struct {
 	inner remoteMapInner
 	// Synchronizes access to inner.
 	lock sync.Mutex
+	// done signals the expiry goroutine to stop.
+	done chan struct{}
 }
 
 // NewRemoteMap creates a RemoteMap that expires peers after a timeout.
 //
 // If the timeout is 0, peers never expire.
+//
+// Call Close when the RemoteMap is no longer needed to stop the expiry
+// goroutine and release resources.
 //
 // The timeout does not have to be kept in sync with smux's idle timeout. If a
 // peer is removed from the map while the smux session is still live, the worst
@@ -48,19 +57,35 @@ func NewRemoteMap(timeout time.Duration) *RemoteMap {
 			byAge:  make([]*remoteRecord, 0),
 			byAddr: make(map[net.Addr]int),
 		},
+		done: make(chan struct{}),
 	}
 	if timeout > 0 {
 		go func() {
+			ticker := time.NewTicker(timeout / 2)
+			defer ticker.Stop()
 			for {
-				time.Sleep(timeout / 2)
-				now := time.Now()
-				m.lock.Lock()
-				m.inner.removeExpired(now, timeout)
-				m.lock.Unlock()
+				select {
+				case <-m.done:
+					return
+				case now := <-ticker.C:
+					m.lock.Lock()
+					m.inner.removeExpired(now, timeout)
+					m.lock.Unlock()
+				}
 			}
 		}()
 	}
 	return m
+}
+
+// Close stops the expiry goroutine and releases all resources.
+func (m *RemoteMap) Close() {
+	select {
+	case <-m.done:
+		// Already closed.
+	default:
+		close(m.done)
+	}
 }
 
 // SendQueue returns the send queue corresponding to addr, creating it if
@@ -108,7 +133,18 @@ func (inner *remoteMapInner) removeExpired(now time.Time, timeout time.Duration)
 	for len(inner.byAge) > 0 && now.Sub(inner.byAge[0].LastSeen) >= timeout {
 		record := heap.Pop(inner).(*remoteRecord)
 		close(record.SendQueue)
+		close(record.Stash)
 	}
+}
+
+// evictOldest removes the oldest entry to make room for new ones.
+func (inner *remoteMapInner) evictOldest() {
+	if len(inner.byAge) == 0 {
+		return
+	}
+	record := heap.Pop(inner).(*remoteRecord)
+	close(record.SendQueue)
+	close(record.Stash)
 }
 
 // Lookup finds the existing record corresponding to addr, or creates a new
@@ -123,6 +159,10 @@ func (inner *remoteMapInner) Lookup(addr net.Addr, now time.Time) *remoteRecord 
 		record.LastSeen = now
 		heap.Fix(inner, i)
 	} else {
+		// Evict oldest entries if at capacity.
+		for len(inner.byAge) >= MaxClients {
+			inner.evictOldest()
+		}
 		// Not found, create a new one.
 		record = &remoteRecord{
 			Addr:      addr,

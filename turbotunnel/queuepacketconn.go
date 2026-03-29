@@ -148,9 +148,10 @@ func (c *QueuePacketConn) closeWithError(err error) error {
 	return nil
 }
 
-// Close unblocks pending operations and makes future operations fail with a
-// "closed connection" error.
+// Close unblocks pending operations, stops the RemoteMap expiry goroutine,
+// and makes future operations fail with a "closed connection" error.
 func (c *QueuePacketConn) Close() error {
+	c.remotes.Close()
 	return c.closeWithError(nil)
 }
 

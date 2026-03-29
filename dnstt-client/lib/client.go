@@ -227,7 +227,7 @@ func AcceptLoop(ln *pt.SocksListener, utlsClientHelloID *utls.ClientHelloID, shu
 
 			mtu := dnsNameCapacity(domain) - 8 - 1 - numPadding - 1 // clientid + padding length prefix + padding + data length prefix
 			if mtu < 80 {
-				log.Printf("domain %s leaves only %d bytes for payload", domain, mtu)
+				log.Printf("domain %s leaves only %d bytes for payload (MTU %d); try using a shorter tunnel domain", domain, mtu)
 
 				_ = local.Reject()
 

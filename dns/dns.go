@@ -56,10 +56,12 @@ const (
 	ClassIN = 1
 
 	// https://tools.ietf.org/html/rfc1035#section-4.1.1
-	RcodeNoError        = 0 // a.k.a. NOERROR
-	RcodeFormatError    = 1 // a.k.a. FORMERR
-	RcodeNameError      = 3 // a.k.a. NXDOMAIN
-	RcodeNotImplemented = 4 // a.k.a. NOTIMPL
+	RcodeNoError         = 0 // a.k.a. NOERROR
+	RcodeFormatError     = 1 // a.k.a. FORMERR
+	RcodeServerFailure   = 2 // a.k.a. SERVFAIL
+	RcodeNameError       = 3 // a.k.a. NXDOMAIN
+	RcodeNotImplemented  = 4 // a.k.a. NOTIMPL
+	RcodeRefused         = 5 // a.k.a. REFUSED
 	// https://tools.ietf.org/html/rfc6891#section-9
 	ExtendedRcodeBadVers = 16 // a.k.a. BADVERS
 )

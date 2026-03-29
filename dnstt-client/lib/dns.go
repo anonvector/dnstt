@@ -547,7 +547,7 @@ func jitter(d time.Duration) time.Duration {
 // isClosedConnError reports whether err is a "use of closed network connection"
 // error, which is expected during graceful shutdown.
 func isClosedConnError(err error) bool {
-	return errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "use of closed")
+	return errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "use of closed") || strings.Contains(err.Error(), "closed connection")
 }
 
 // sendLoop takes packets that have been written using c.WriteTo, and sends them
@@ -660,7 +660,7 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 		}
 		if err != nil {
 			// Stop the loop if the transport has been closed.
-			if errors.Is(err, net.ErrClosed) || strings.Contains(err.Error(), "use of closed") {
+			if isClosedConnError(err) {
 				return err
 			}
 			log.Printf("send: %v", err)
