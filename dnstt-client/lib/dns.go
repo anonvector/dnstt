@@ -38,13 +38,13 @@ const (
 	// to a maximum of maxPollDelay. The poll timer is reset to
 	// initPollDelay whenever an a send occurs that is not the result of the
 	// poll timer expiring.
-	initPollDelay       = 1 * time.Second
+	initPollDelay       = 500 * time.Millisecond
 	maxPollDelay        = 10 * time.Second
 	pollDelayMultiplier = 2.0
 
 	// A limit on the number of empty poll requests we may send in a burst
 	// as a result of receiving data.
-	pollLimit = 10
+	pollLimit = 16
 )
 
 // SendFunc is the type for custom send functions that can replace the default
