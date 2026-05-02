@@ -512,12 +512,14 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 
 		_, err = dnsConn.WriteTo(buf, rec.Addr)
 		if err != nil {
-			//goland:noinspection GoDeprecation
-			if err, ok := err.(net.Error); ok && err.Temporary() {
-				log.Printf("WriteTo temporary error: %v", err)
-				continue
+			// net.ErrClosed means we'll never be able to send on
+			// dnsConn, so terminate the loop. Treat all other
+			// errors as temporary and simply log them.
+			if errors.Is(err, net.ErrClosed) {
+				return err
 			}
-			return err
+			log.Printf("WriteTo error: %v", err)
+			continue
 		}
 	}
 	return nil
@@ -625,7 +627,17 @@ func Run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketCon
 	defer func() {
 		_ = ln.Close()
 	}()
+
+	// We will run acceptSessions, sendLoop, and recvLoop concurrently. The
+	// first one to finish closes the done channel, which causes Run to
+	// return. This ensures that a failure in any goroutine takes the whole
+	// process down rather than leaving a "running but not working" server.
+	doneChan := make(chan struct{})
+	var doneOnce sync.Once
+	done := func() { doneOnce.Do(func() { close(doneChan) }) }
+
 	go func() {
+		defer done()
 		err := acceptSessions(ln, privkey, mtu, upstream)
 		if err != nil {
 			log.Printf("acceptSessions: %v", err)
@@ -636,11 +648,21 @@ func Run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketCon
 	defer close(ch)
 
 	go func() {
+		defer done()
 		err := sendLoop(dnsConn, ttConn, ch, maxEncodedPayload, maxUDPPayload, hooks)
 		if err != nil {
 			log.Printf("sendLoop: %v", err)
 		}
 	}()
 
-	return recvLoop(domain, dnsConn, ttConn, ch, maxUDPPayload, hooks)
+	go func() {
+		defer done()
+		err := recvLoop(domain, dnsConn, ttConn, ch, maxUDPPayload, hooks)
+		if err != nil {
+			log.Printf("recvLoop: %v", err)
+		}
+	}()
+
+	<-doneChan
+	return nil
 }
